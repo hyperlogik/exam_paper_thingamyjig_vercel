@@ -149,10 +149,32 @@
         }
 
         async function pollStatus(jobId, cardId) {
+            let failedPolls = 0;
             const interval = setInterval(async () => {
-                const res = await fetch(`/status/${jobId}`);
-                const data = await res.json();
-                
+                let res, data;
+                try {
+                    res = await fetch(`/status/${jobId}`);
+                    data = await res.json();
+                } catch (err) {
+                    // Network hiccup or server briefly unreachable - tolerate a few
+                    failedPolls++;
+                    if (failedPolls >= 5) {
+                        clearInterval(interval);
+                        document.getElementById(`${cardId}_status`).innerHTML = `<span class="text-red-500">Lost contact with the server. Please refresh and re-upload this file.</span>`;
+                        document.getElementById(`${cardId}_bar`).classList.replace('bg-indigo-600', 'bg-red-500');
+                    }
+                    return;
+                }
+                failedPolls = 0;
+
+                if (res.status === 404) {
+                    // Server restarted and forgot the job (in-memory registry)
+                    clearInterval(interval);
+                    document.getElementById(`${cardId}_status`).innerHTML = `<span class="text-red-500">Job lost — the server restarted mid-conversion. Please re-upload this file.</span>`;
+                    document.getElementById(`${cardId}_bar`).classList.replace('bg-indigo-600', 'bg-red-500');
+                    return;
+                }
+
                 document.getElementById(`${cardId}_name`).textContent = data.filename;
                 document.getElementById(`${cardId}_pct`).textContent = `${Math.round(data.progress)}%`;
                 document.getElementById(`${cardId}_bar`).style.width = `${data.progress}%`;

@@ -1,3 +1,4 @@
+import os
 import base64
 import json
 import fitz  # PyMuPDF
@@ -7,46 +8,71 @@ from docx import Document
 from docx.shared import RGBColor, Inches
 from openai import OpenAI
 
+
 def encode_image(img):
     buffered = BytesIO()
-    img.save(buffered, format="JPEG")
+    img.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def extract_pages(file_bytes, ext):
-    images = []
-    
-    if ext == '.pdf':
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(dpi=300)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            images.append(img)
-    elif ext in ['.png', '.jpg', '.jpeg']:
-        img = Image.open(BytesIO(file_bytes)).convert('RGB')
-        img.thumbnail((2000, 2000))
-        images.append(img)
-        
-    return images
 
-def process_exam_paper(file_bytes, ext, api_key, include_images):
+def count_pages(filepath):
+    """Count pages without loading any page images into memory."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == '.pdf':
+        with fitz.open(filepath) as doc:
+            return len(doc)
+    return 1
+
+
+def extract_pages(filepath):
+    """Yield page images one at a time so only a single page is ever in memory."""
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext == '.pdf':
+        doc = fitz.open(filepath)
+        try:
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                # 150 dpi is plenty for GPT-4o (it downsizes to ~2048px anyway)
+                # and uses a quarter of the memory of 300 dpi.
+                pix = page.get_pixmap(dpi=150)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                pix = None  # release pixmap buffer promptly
+                img.thumbnail((2000, 2000))
+                yield img
+        finally:
+            doc.close()
+    elif ext in ['.png', '.jpg', '.jpeg']:
+        img = Image.open(filepath).convert('RGB')
+        img.thumbnail((2000, 2000))
+        yield img
+
+
+def process_exam_paper(filepath, output_path, api_key, include_images, progress_callback):
+    # Initialize the client dynamically with the user's provided key
     client = OpenAI(api_key=api_key)
-    images = extract_pages(file_bytes, ext)
+
+    total_pages = count_pages(filepath)
     doc = Document()
-    
-    for i, img in enumerate(images):
+
+    for i, img in enumerate(extract_pages(filepath)):
+        progress_callback(int((i / total_pages) * 90))  # Allocate 90% of progress to API calls
+
+        # Optionally embed the scanned page into the Word doc
         if include_images:
+            img_path = f"{filepath}_temp_page_{i}.jpg"
             img_copy = img.copy()
             img_copy.thumbnail((600, 600))
-            img_byte_arr = BytesIO()
-            img_copy.save(img_byte_arr, format='JPEG')
-            img_byte_arr.seek(0)
-            doc.add_picture(img_byte_arr, width=Inches(6.0))
-            
+            img_copy.save(img_path)
+            doc.add_picture(img_path, width=Inches(6.0))
+            os.remove(img_path)
+
         base64_image = encode_image(img)
-        
+        img = None  # free the page image before waiting on the API
+
+        # Send to OpenAI
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
             response_format={"type": "json_object"},
             messages=[
                 {
@@ -63,25 +89,28 @@ def process_exam_paper(file_bytes, ext, api_key, include_images):
             ],
             max_tokens=4000
         )
-        
+
         try:
             content = json.loads(response.choices[0].message.content)
             blocks = content.get('blocks', [])
+
+            # Format the output document
             for block in blocks:
                 p = doc.add_paragraph()
                 run = p.add_run(block.get('text', ''))
+
                 if block.get('type') == 'handwritten':
-                    run.font.color.rgb = RGBColor(0, 0, 255)
+                    run.font.color.rgb = RGBColor(0, 0, 255)  # Blue for handwriting
                     run.italic = True
                 else:
-                    run.font.color.rgb = RGBColor(0, 0, 0)
+                    run.font.color.rgb = RGBColor(0, 0, 0)  # Black for printed text
+
         except json.JSONDecodeError:
             doc.add_paragraph("[Error parsing transcription JSON structure for this page]")
-            
-        if i < len(images) - 1:
+
+        if i < total_pages - 1:
             doc.add_page_break()
-            
-    output_stream = BytesIO()
-    doc.save(output_stream)
-    output_stream.seek(0)
-    return output_stream
+
+    progress_callback(95)  # Finalizing document
+    doc.save(output_path)
+    progress_callback(100)  # Complete
